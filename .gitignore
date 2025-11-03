@@ -1,0 +1,30 @@
+# Compressed files
+*.zip
+
+# Model files
+models/
+
+# Large data files (too big for GitHub)
+data/
+
+# Environment files
+.env
+
+# macOS files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environment
+venv/
+env/
+ENV/
+.venv
