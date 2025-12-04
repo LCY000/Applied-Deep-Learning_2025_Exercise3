@@ -1,54 +1,237 @@
-# ADL HW3 - Retrieval-Augmented Generation (RAG) System
+# Retrieval-Augmented Generation (RAG) System
+> *Advanced Document Retrieval & Question Answering System implemented for ADL HW3*
 
-這是一個完整的 RAG 系統實作,包含 **Bi-Encoder Retriever** 和 **Cross-Encoder Reranker** 兩階段檢索架構。
-
-## ⚠️ 重要提醒
-
-### 數據文件下載
-
-由於 `data/` 資料夾中的檔案過大（超過 GitHub 100MB 限制），因此未包含在此儲存庫中。
-
-**請從以下連結下載完整的數據資料夾：**
-
-🔗 [Google Drive - Data 資料夾](https://drive.google.com/drive/folders/1v5hSQYPyQuUnzaE1Lp3F1vejNazW48TH?usp=sharing)
-
-下載後，請將 `data/` 資料夾放置在專案根目錄下。
+這是一個高效能的 **RAG (Retrieval-Augmented Generation)** 系統，結合了 **Bi-Encoder** 進行快速初步檢索與 **Cross-Encoder** 進行精確重排序，並透過優化的 **Prompt Engineering** 引導 LLM 生成準確答案。
 
 ## 📋 目錄
 
-- [環境設定](#環境設定)
-- [模型訓練](#模型訓練)
-  - [Retriever 模型訓練](#1-retriever-模型訓練)
-  - [Reranker 模型訓練](#2-reranker-模型訓練)
-- [模型推論](#模型推論)
-- [專案結構](#專案結構)
+- [專案成果 (Key Results)](#-專案成果-key-results)
+- [方法論 (Methodology)](#-方法論-methodology)
+- [消融實驗 (Ablation Study)](#q3-消融實驗-ablation-study)
+- [詳細模型訓練 (Detailed Training)](#詳細模型訓練)
+- [模型推論 (Inference)](#模型推論)
+- [專案結構 (Project Structure)](#專案結構)
+- [重要提醒 (Data Download)](#-重要提醒)
+- [環境設定 (Environment)](#環境設定)
 - [參考資料](#參考資料)
 
 ---
 
-## 環境設定
+## 🏆 專案成果 (Key Results)
 
-### 系統需求
-- Python 3.12
-- CUDA 12.4 (用於 GPU 加速)
-- 至少 16GB GPU 記憶體 (建議使用 RTX 3090 或更高規格)
+本系統在測試集上展現了優異的檢索與生成能力，透過兩階段檢索架構顯著提升了準確度。
 
-### 安裝相依套件
-
-```bash
-pip install -r requirements.txt
-```
-
-### 主要套件版本
-- `transformers==4.56.1`
-- `torch==2.8.0` (with CUDA 12.4 support)
-- `sentence-transformers==5.1.0`
-- `faiss-gpu-cu12==1.12.0`
-- `datasets==4.0.0`
+| Metric | Score | Description |
+|--------|-------|-------------|
+| **Recall@10** | **0.8900** | Retriever 成功在前 10 筆中找回正確文檔的比例 |
+| **MRR@10** | **0.7745** | 加入 Reranker 後，正確文檔的平均倒數排名顯著提升 (+16.7%) |
+| **CosSim** | **0.4143** | 生成答案與標準答案的語意相似度 |
 
 ---
 
-## 模型訓練
+## 📖 方法論 (Methodology)
+
+本專案採用兩階段檢索策略 (Two-Stage Retrieval)，流程如下：
+1. **Retriever**: 從海量文檔中快速篩選 Top-100 候選。
+2. **Reranker**: 對候選文檔進行精細評分排序，選出 Top-5。
+3. **Reader (LLM)**: 根據 Top-5 文檔生成最終答案。
+
+### 1. Retriever: Bi-Encoder Training
+我使用 `intfloat/multilingual-e5-small` 作為基底模型，採用 **MultipleNegativesRankingLoss (MNRL)** 進行微調。
+
+- **訓練策略**:
+    - **Anchor**: 重寫後的查詢 (Rewrite Query)
+    - **Positive**: 標註為相關的文檔
+    - **Negative**: 同一個 Batch 中的其他文檔 (In-batch negatives) + 硬負樣本 (Hard negatives)
+- **訓練成效**:
+    - Loss 從初始的 0.85 迅速收斂至 0.06，顯示模型有效學習到了語意匹配關係。
+    - 最終 Recall@10 達到 **0.8677**。
+
+![Retriever Training Loss](training_loss_curve.png)
+*圖 1: Bi-Encoder 訓練損失收斂曲線*
+
+
+> [!TIP]
+> **訓練發現**: 發現了在訓練中會過擬合 (Overfitting)，我發現訓練 **1 個 Epoch** 的效果最佳，過多的訓練反而會導致驗證集表現下降。
+
+### 2. Reranker: Cross-Encoder Optimization
+我比較了「微調模型」與「預訓練模型」的效果。
+
+- **模型架構**: `cross-encoder/ms-marco-MiniLM-L-12-v2`
+- **實驗發現**:
+    - **微調嘗試**: 使用 Weighted BCE Loss 進行訓練，但發現由於資料量限制，微調後的 MRR@10 (0.2011) 反而不如預訓練模型。
+    - **最終決策**: 直接採用 **預訓練模型**，獲得了最佳的 MRR@10 (**0.7558**)。這證實了在特定資料集較小的情況下，強大的通用預訓練模型往往更具優勢。
+
+![Reranker Performance](reranker_training_loss_3.png)
+*圖 2: Reranker 訓練與驗證損失分析*
+
+
+### 3. Prompt Engineering (LLM)
+為了讓 LLM (Claude/GPT) 生成精準答案，我進行了多輪 Prompt 優化：
+
+- **v1 (Initial)**: 設定角色 ("precise question-answering assistant") 並限制 "based ONLY on the given context"。
+- **v2 (Simplified)**: 嘗試簡化指令，但發現模型容易產生幻覺或格式錯誤。
+- **v3 (Final)**: 
+    - 加入 **結構化輸入** (`[Passage 1]`, `[Passage 2]`)。
+    - 強制 **"One Answer"** 限制，避免針對每個段落分別回答。
+    - 優化 **Answer Parsing** 邏輯，準確過濾 "The answer is:" 等贅詞。
+    - **結果**: 配合 Reranker，最終 Cosine Similarity 達到 **0.4143**。
+
+#### 最佳 Prompt 格式 (Best Prompt Format)
+
+最終採用的 Prompt 格式如下，強調了「精確引用」與「單一答案」的限制：
+
+```text
+Context passages:
+[1] <passage_content_1>
+[2] <passage_content_2>
+...
+
+Question: <query>
+
+Instructions:
+1. Read all passages carefully to find the only answer
+2. Your answer MUST be copied EXACTLY from the passage text - do NOT paraphrase or change any words
+3. Copy the relevant sentence(s) word-for-word from the passage
+4. If the answer is not found in any passage, write exactly: CANNOTANSWER
+
+Answer:
+```
+
+關於 LLM 生成後的答案解析與過濾程式碼，請參考 [utils.py](utils.py)。
+
+
+---
+
+## 🔬 深入實驗分析：消融研究 (Ablation Study)
+
+為了驗證上述 **兩階段檢索架構 (Two-Stage Retrieval)** 的必要性，並探討 **Reranker** 與 **檢索數量 (Top-K)** 對最終 RAG 系統效能的具體影響，我設計了以下消融實驗。
+
+### 實驗目的
+
+分析關鍵組件對檢索效能的貢獻：
+1. **Reranker 的必要性**: 比較是否加入 Reranker 對 MRR (Mean Reciprocal Rank) 的提升幅度。
+2. **數量 vs 品質**: 測試單純增加 Retriever 的檢索數量 (Top-K)，是否能彌補移除 Reranker 後的效能損失。
+
+### 實驗設計
+
+設計了三組對照實驗:
+
+| 實驗組 | 配置 | 說明 |
+|--------|------|------|
+| **實驗 1** | Retriever Only (Top 3) | 只用 Retriever,取前 3 名直接送入 LLM |
+| **實驗 2** | Retriever + Reranker (Top 3) | 使用 Reranker 重排後,取前 3 名送入 LLM |
+| **實驗 3** | Retriever Only (Top 5) | 只用 Retriever,但增加到前 5 名送入 LLM |
+
+### 執行實驗
+
+使用 `inference_ablation.py` 腳本進行消融實驗:
+
+```bash
+# 執行所有實驗 (推薦)
+python inference_ablation.py --mode all
+
+# 或分別執行單一實驗
+python inference_ablation.py --mode retriever_only    # 只執行實驗 1
+python inference_ablation.py --mode with_reranker     # 只執行實驗 2
+python inference_ablation.py --mode retriever_more    # 只執行實驗 3
+```
+
+### 實驗結果
+
+實驗結果會儲存在 `results/` 目錄下:
+- `ablation_retriever_only_top3.json` - 實驗 1 結果
+- `ablation_with_reranker_top3.json` - 實驗 2 結果
+- `ablation_retriever_only_top5.json` - 實驗 3 結果
+- `ablation_summary.json` - 實驗總結
+
+### 預期分析方向
+
+**問題 1: Reranker 是否能明顯提升 MRR?**
+- 比較實驗 1 vs 實驗 2 的 MRR@10 差異
+- 分析 Reranker 對排序品質的影響
+- 觀察有無 Reranker 對最終答案生成的影響
+
+**問題 2: 增加輸入筆數能否彌補沒有 Reranker?**
+- 比較實驗 1 (Top 3) vs 實驗 3 (Top 5)
+- 比較實驗 2 (Reranker + Top 3) vs 實驗 3 (Retriever Only + Top 5)
+- 分析「量」(更多候選) 是否能補償「質」(Reranker 重排)
+
+### 實驗結果與分析
+
+我在 100 筆測試資料上進行了消融實驗,測試結果如下:
+
+#### 實驗數據
+
+| 實驗配置 | Recall@10 | MRR@10 | Bi-Encoder CosSim |
+|---------|-----------|--------|-------------------|
+| **實驗 1**: Retriever Only (Top 3) | 0.8900 | 0.6633 | 0.4026 |
+| **實驗 2**: Retriever + Reranker (Top 3) | 0.8900 | 0.7745 | 0.4143 |
+| **實驗 3**: Retriever Only (Top 5) | 0.8900 | 0.6633 | 0.4131 |
+| **實驗 4**: Retriever Only (Top 8) | 0.8900 | 0.6633 | 0.4039 |
+
+#### 關鍵發現
+
+**1. Reranker 的影響**
+- **MRR@10 提升**: 從 0.6633 提升至 0.7745 (+16.77%)
+- **Bi-Encoder CosSim 提升**: 從 0.4026 提升至 0.4143 (+2.91%)
+- **結論**: Reranker 能顯著提升相關文檔的排序品質,使正確答案更容易被 LLM 識別
+
+**2. 增加輸入筆數的效果**
+- **Top 3 → Top 5**: Bi-Encoder CosSim 從 0.4026 提升至 0.4131 (+2.61%)
+- **Top 5 → Top 8**: Bi-Encoder CosSim 從 0.4131 下降至 0.4039 (-2.23%)
+- **結論**: 適度增加輸入筆數 (Top 5) 能提升效果,但過多 (Top 8) 反而降低 LLM 判斷準確度
+
+**3. 能否用增加輸入筆數彌補沒有 Reranker?**
+- **Retriever + Reranker (Top 3)**: CosSim = 0.4143
+- **Retriever Only (Top 5)**: CosSim = 0.4131
+- **差距**: 僅 0.0012 (0.29%)
+- **結論**: ✅ **可以!** Top 5 幾乎完全彌補了沒有 Reranker 的影響
+
+#### 深入分析
+
+**為什麼增加筆數能彌補 Reranker?**
+1. **LLM 的全文閱讀特性**: LLM 會讀取所有輸入的參考文章,並不依賴順序
+2. **提示詞的重要性**: 良好的提示詞能引導 LLM 從多篇文章中提取正確資訊
+3. **資訊覆蓋率**: Top 5 增加了包含正確答案的機率,即使排序不佳也能被 LLM 找到
+
+**為什麼 Top 8 反而變差?**
+1. **資訊過載**: 過多的參考文章可能造成 LLM 注意力分散
+2. **雜訊增加**: Top 8 包含更多不相關文章,干擾 LLM 判斷
+3. **最佳平衡點**: 對於此任務,Top 5 是資訊量與品質的最佳平衡
+
+#### 實務建議
+
+**情境 1: 追求最高準確度**
+- 使用 **Retriever + Reranker (Top 3)**
+- MRR@10: 0.7745 (最高)
+- Bi-Encoder CosSim: 0.4143 (最高)
+- 計算成本: 較高 (需執行 Cross-Encoder)
+
+**情境 2: 平衡效能與準確度** ⭐ **推薦**
+- 使用 **Retriever Only (Top 5)**
+- Bi-Encoder CosSim: 0.4131 (接近最高)
+- 計算成本: 低 (僅需 Bi-Encoder)
+- **效能提升**: 省去 Reranker 計算,推論速度提升 ~50%
+
+**情境 3: 極致效能優先**
+- 使用 **Retriever Only (Top 3)**
+- Bi-Encoder CosSim: 0.4026 (可接受)
+- 計算成本: 最低
+- 適合即時性要求極高的應用
+
+#### 最終結論
+
+> **在具備良好提示詞的前提下,使用 Retriever Only (Top 5) 是最佳選擇!**
+> 
+> 此配置可以:
+> - ✅ 幾乎達到 Reranker 的效果 (差距僅 0.29%)
+> - ✅ 降低計算成本 (省去 Cross-Encoder 運算)
+> - ✅ 簡化系統架構 (單一模型)
+
+---
+
+## 詳細模型訓練
 
 ### 1. Retriever 模型訓練
 
@@ -284,200 +467,59 @@ python inference_batch.py \
 
 ```
 ADL/HW3/
-├── data/
-│   ├── corpus.txt              # 文檔庫
-│   ├── train.txt               # 訓練資料
-│   ├── qrels.txt               # 相關性標註
-│   └── test_open.txt           # 測試資料
-│
-├── models/
-│   ├── retriever/              # 訓練好的 Retriever 模型 (1 epoch)
-│   ├── reranker/               # 預訓練 Reranker 模型 (下載後存放)
-│   └── reranker-*-val/         # 微調 Reranker 模型 (實驗用,效果較差)
-│
-├── results/
-│   └── result.json             # 推論結果
-│
-├── output/                     # Retriever 訓練輸出
-│   └── train_bi-encoder-mnrl-*/
-│
-├── vector_database/            # FAISS 向量資料庫
-│   ├── passage_index.faiss
-│   └── passage_store.db
-│
-├── train_bi-encoder_mnrl_with_logging.py   # Retriever 訓練腳本
-├── train_reranker.py                       # Reranker 訓練腳本 (實驗用)
-├── download_pretrained_reranker.py         # 下載預訓練 Reranker 模型
-├── save_embeddings.py                      # 建立向量資料庫
-├── inference_batch.py                      # 批次推論腳本
-├── inference_ablation.py                   # 消融實驗腳本 (Q3)
-├── plot_training_log.py                    # 繪製訓練曲線
-├── utils.py                                # 工具函數
-├── download.sh                             # 下載訓練好的模型
-├── requirements.txt                        # 相依套件
-├── retriever模型訓練說明.md                 # Retriever 訓練詳細說明
-├── reranker訓練說明.md                     # Reranker 訓練詳細說明
-└── README.md                               # 本檔案
+├── results/                # 推論結果
+├── download.sh             # 模型下載腳本
+├── download_pretrained_reranker.py
+├── inference_ablation.py   # Q3 消融實驗
+├── inference_batch.py      # 主要推論腳本
+├── plot_training_log.py    # 繪圖工具
+├── requirements.txt        # 套件需求
+├── run_ablation.sh         # 執行消融實驗腳本
+├── save_embeddings.py      # 建立向量資料庫
+├── train_bi-encoder_mnrl_with_logging.py # Retriever 訓練
+├── train_reranker.py       # Reranker 訓練
+├── utils.py                # 工具函式
+├── README.md               # 本文件
+├── report.pdf              # 作業報告
+├── retriever模型訓練說明.md
+└── reranker訓練說明.md
 ```
 
 ---
 
-## 實驗結果與分析
+## ⚠️ 重要提醒
 
-### Retriever 訓練結果
-- **訓練樣本數**: ~4 個三元組/查詢
-- **損失函數**: MultipleNegativesRankingLoss
-- **訓練曲線**: 見 `output/train_bi-encoder-mnrl-*/training_loss_curve.png`
+### 數據文件下載
 
-**實驗發現 - 過擬合問題**:
-經過實驗發現,Retriever 模型在訓練過程中出現過擬合現象:
-- 訓練損失持續下降,但驗證效果在第 1 個 epoch 後開始下降
-- **最終選擇**: 使用訓練 **1 個 epoch** 後的模型,表現最佳
-- 建議在訓練時監控驗證集表現,避免過度訓練
+由於 `data/` 資料夾中的檔案過大（超過 GitHub 100MB 限制），因此未包含在此儲存庫中。
 
-### Reranker 訓練結果
-- **訓練樣本數**: ~5 個樣本/查詢 (1 正 + 4 負)
-- **損失函數**: Weighted Binary Cross-Entropy Loss
-- **正負樣本比例**: 1:4
-- **訓練與驗證曲線**: 見 `models/reranker-*/training_validation_loss.png`
+**請從以下連結下載完整的數據資料夾：**
 
-**實驗發現 - 預訓練模型表現更佳**:
-經過實驗發現,Reranker 微調後的效果不如預訓練模型:
-- 微調模型在約 **1000 steps** 時效果相對較好,但仍不及預訓練模型
-- 可能原因:訓練資料規模較小,無法充分發揮微調的優勢
-- **最終選擇**: 使用 **`cross-encoder/ms-marco-MiniLM-L-12-v2` 預訓練模型**進行推論
+🔗 [Google Drive - Data 資料夾](https://drive.google.com/drive/folders/1v5hSQYPyQuUnzaE1Lp3F1vejNazW48TH?usp=sharing)
 
-### 模型選擇總結
-| 模型 | 最終使用 | 原因 |
-|------|----------|------|
-| Retriever | 訓練 1 epoch 的模型 | 避免過擬合,表現最佳 |
-| Reranker | 預訓練模型 | 微調效果不佳,預訓練模型更穩定 |
+下載後，請將 `data/` 資料夾放置在專案根目錄下。
 
 ---
 
-## Q3: 消融實驗 (Ablation Study)
+## 環境設定
 
-### 實驗目的
+### 系統需求
+- Python 3.12
+- CUDA 12.4 (用於 GPU 加速)
+- 至少 16GB GPU 記憶體 (建議使用 RTX 3090 或更高規格)
 
-分析 Reranker 模型對檢索效能的影響:
-1. **比較 Reranker 是否能明顯提升 MRR**
-2. **測試增加輸入筆數是否能彌補沒有 Reranker 的效果**
-
-### 實驗設計
-
-我們設計了三組對照實驗:
-
-| 實驗組 | 配置 | 說明 |
-|--------|------|------|
-| **實驗 1** | Retriever Only (Top 3) | 只用 Retriever,取前 3 名直接送入 LLM |
-| **實驗 2** | Retriever + Reranker (Top 3) | 使用 Reranker 重排後,取前 3 名送入 LLM |
-| **實驗 3** | Retriever Only (Top 5) | 只用 Retriever,但增加到前 5 名送入 LLM |
-
-### 執行實驗
-
-使用 `inference_ablation.py` 腳本進行消融實驗:
+### 安裝相依套件
 
 ```bash
-# 執行所有實驗 (推薦)
-python inference_ablation.py --mode all
-
-# 或分別執行單一實驗
-python inference_ablation.py --mode retriever_only    # 只執行實驗 1
-python inference_ablation.py --mode with_reranker     # 只執行實驗 2
-python inference_ablation.py --mode retriever_more    # 只執行實驗 3
+pip install -r requirements.txt
 ```
 
-### 實驗結果
-
-實驗結果會儲存在 `results/` 目錄下:
-- `ablation_retriever_only_top3.json` - 實驗 1 結果
-- `ablation_with_reranker_top3.json` - 實驗 2 結果
-- `ablation_retriever_only_top5.json` - 實驗 3 結果
-- `ablation_summary.json` - 實驗總結
-
-### 預期分析方向
-
-**問題 1: Reranker 是否能明顯提升 MRR?**
-- 比較實驗 1 vs 實驗 2 的 MRR@10 差異
-- 分析 Reranker 對排序品質的影響
-- 觀察有無 Reranker 對最終答案生成的影響
-
-**問題 2: 增加輸入筆數能否彌補沒有 Reranker?**
-- 比較實驗 1 (Top 3) vs 實驗 3 (Top 5)
-- 比較實驗 2 (Reranker + Top 3) vs 實驗 3 (Retriever Only + Top 5)
-- 分析「量」(更多候選) 是否能補償「質」(Reranker 重排)
-
-### 實驗結果與分析
-
-我們在 100 筆測試資料上進行了消融實驗,測試結果如下:
-
-#### 實驗數據
-
-| 實驗配置 | Recall@10 | MRR@10 | Bi-Encoder CosSim |
-|---------|-----------|--------|-------------------|
-| **實驗 1**: Retriever Only (Top 3) | 0.8900 | 0.6633 | 0.4026 |
-| **實驗 2**: Retriever + Reranker (Top 3) | 0.8900 | 0.7745 | 0.4143 |
-| **實驗 3**: Retriever Only (Top 5) | 0.8900 | 0.6633 | 0.4131 |
-| **實驗 4**: Retriever Only (Top 8) | 0.8900 | 0.6633 | 0.4039 |
-
-#### 關鍵發現
-
-**1. Reranker 的影響**
-- **MRR@10 提升**: 從 0.6633 提升至 0.7745 (+16.77%)
-- **Bi-Encoder CosSim 提升**: 從 0.4026 提升至 0.4143 (+2.91%)
-- **結論**: Reranker 能顯著提升相關文檔的排序品質,使正確答案更容易被 LLM 識別
-
-**2. 增加輸入筆數的效果**
-- **Top 3 → Top 5**: Bi-Encoder CosSim 從 0.4026 提升至 0.4131 (+2.61%)
-- **Top 5 → Top 8**: Bi-Encoder CosSim 從 0.4131 下降至 0.4039 (-2.23%)
-- **結論**: 適度增加輸入筆數 (Top 5) 能提升效果,但過多 (Top 8) 反而降低 LLM 判斷準確度
-
-**3. 能否用增加輸入筆數彌補沒有 Reranker?**
-- **Retriever + Reranker (Top 3)**: CosSim = 0.4143
-- **Retriever Only (Top 5)**: CosSim = 0.4131
-- **差距**: 僅 0.0012 (0.29%)
-- **結論**: ✅ **可以!** Top 5 幾乎完全彌補了沒有 Reranker 的影響
-
-#### 深入分析
-
-**為什麼增加筆數能彌補 Reranker?**
-1. **LLM 的全文閱讀特性**: LLM 會讀取所有輸入的參考文章,並不依賴順序
-2. **提示詞的重要性**: 良好的提示詞能引導 LLM 從多篇文章中提取正確資訊
-3. **資訊覆蓋率**: Top 5 增加了包含正確答案的機率,即使排序不佳也能被 LLM 找到
-
-**為什麼 Top 8 反而變差?**
-1. **資訊過載**: 過多的參考文章可能造成 LLM 注意力分散
-2. **雜訊增加**: Top 8 包含更多不相關文章,干擾 LLM 判斷
-3. **最佳平衡點**: 對於此任務,Top 5 是資訊量與品質的最佳平衡
-
-#### 實務建議
-
-**情境 1: 追求最高準確度**
-- 使用 **Retriever + Reranker (Top 3)**
-- MRR@10: 0.7745 (最高)
-- Bi-Encoder CosSim: 0.4143 (最高)
-- 計算成本: 較高 (需執行 Cross-Encoder)
-
-**情境 2: 平衡效能與準確度** ⭐ **推薦**
-- 使用 **Retriever Only (Top 5)**
-- Bi-Encoder CosSim: 0.4131 (接近最高)
-- 計算成本: 低 (僅需 Bi-Encoder)
-- **效能提升**: 省去 Reranker 計算,推論速度提升 ~50%
-
-**情境 3: 極致效能優先**
-- 使用 **Retriever Only (Top 3)**
-- Bi-Encoder CosSim: 0.4026 (可接受)
-- 計算成本: 最低
-- 適合即時性要求極高的應用
-
-#### 最終結論
-
-> **在具備良好提示詞的前提下,使用 Retriever Only (Top 5) 是最佳選擇!**
-> 
-> 此配置可以:
-> - ✅ 幾乎達到 Reranker 的效果 (差距僅 0.29%)
-> - ✅ 降低計算成本 (省去 Cross-Encoder 運算)
-> - ✅ 簡化系統架構 (單一模型)
+### 主要套件版本
+- `transformers==4.56.1`
+- `torch==2.8.0` (with CUDA 12.4 support)
+- `sentence-transformers==5.1.0`
+- `faiss-gpu-cu12==1.12.0`
+- `datasets==4.0.0`
 
 ---
 
@@ -488,71 +530,6 @@ python inference_ablation.py --mode retriever_more    # 只執行實驗 3
 3. **E5 Text Embeddings**: https://huggingface.co/intfloat/multilingual-e5-small
 4. **Cross-Encoder for Re-Ranking**: https://www.sbert.net/examples/applications/cross-encoder/README.html
 5. **MultipleNegativesRankingLoss**: https://www.sbert.net/docs/package_reference/losses.html#multiplenegativesrankingloss
-
----
-
-## 注意事項
-
-⚠️ **重要提醒**:
-- 確保有足夠的 GPU 記憶體進行訓練 (建議 16GB+)
-- 訓練 Retriever 約需 1 小時 (視硬體而定)
-- **Retriever 建議只訓練 1 個 epoch**,避免過擬合
-- Reranker 微調效果不佳,**建議直接使用預訓練模型**
-- **重要**: 推論前請先下載 Reranker 預訓練模型到本地 (見「模型推論」章節)
-
-### 快速開始 (使用已訓練模型 - 推薦)
-
-如果你要直接使用已訓練好的模型進行推論：
-
-```bash
-# 1. 安裝套件
-pip install -r requirements.txt
-
-# 2. 下載訓練好的模型
-bash download.sh
-
-# 3. 建立向量資料庫
-python save_embeddings.py --retriever_model_path ./models/retriever --build_db
-
-# 4. 設定 HF Token
-echo 'hf_token="your_token_here"' > .env
-
-# 5. 執行推論
-python inference_batch.py \
-    --test_data_path ./data/test_open.txt \
-    --retriever_model_path ./models/retriever \
-    --reranker_model_path ./models/reranker
-```
-
-### 從頭訓練 (完整流程)
-
-如果你要從頭開始訓練模型：
-
-```bash
-# 1. 安裝套件
-pip install -r requirements.txt
-
-# 2. 訓練 Retriever (僅 1 epoch，避免過擬合)
-python train_bi-encoder_mnrl_with_logging.py --epochs 1 --train_batch_size 64
-
-# 3. 將訓練好的 Retriever 複製到 models/retriever
-cp -r output/train_bi-encoder-mnrl-intfloat-multilingual-e5-small-*/  ./models/retriever
-
-# 4. 下載預訓練 Reranker 模型 (效果最佳)
-python download_pretrained_reranker.py
-
-# 5. 建立向量資料庫
-python save_embeddings.py --retriever_model_path ./models/retriever --build_db
-
-# 6. 設定 HF Token
-echo 'hf_token="your_token_here"' > .env
-
-# 7. 執行推論
-python inference_batch.py \
-    --test_data_path ./data/test_open.txt \
-    --retriever_model_path ./models/retriever \
-    --reranker_model_path ./models/reranker
-```
 
 ---
 
